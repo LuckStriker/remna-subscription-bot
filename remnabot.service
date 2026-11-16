@@ -1,0 +1,14 @@
+[Unit]
+Description=Remnawave Telegram bot
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/remnabot
+ExecStart=/opt/remnabot/venv/bin/python main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

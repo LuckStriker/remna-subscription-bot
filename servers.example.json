@@ -1,0 +1,17 @@
+[
+  {
+    "name": "Panel",
+    "role": "panel",
+    "local": true,
+    "compose_dirs": ["/opt/remnawave", "/opt/remnawave/subscription"]
+  },
+  {
+    "name": "NL-1",
+    "role": "node",
+    "host": "203.0.113.10",
+    "port": 22,
+    "user": "root",
+    "key_path": "~/.ssh/remnabot",
+    "compose_dirs": ["/opt/remnanode"]
+  }
+]
