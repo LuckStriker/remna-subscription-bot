@@ -1,9 +1,13 @@
 """Акции и реквизиты оплаты.
 
-• «первые N новых подписчиков, чей чек одобрен» → +M дней (PAID_PROMO_*). Старые клиенты не участвуют.
+• «бонус за первую оплату через бота» → +M дней за ПЕРВЫЙ одобренный чек (на месяц и больше) — любому клиенту:
+  новому, нынешнему, бывшему. Цель — приучить платить через бота (PAID_PROMO_*; LIMIT 0 — без лимита).
 • «первые N, привязавших подписку» (FIRST_PROMO_*) — старая акция, выключается FIRST_PROMO_LIMIT=0.
 """
+import asyncio
+import json
 import logging
+from datetime import datetime
 
 from aiogram import Bot
 
@@ -22,17 +26,30 @@ def promo_slots_left() -> int:
 
 
 def paid_slots_left() -> int:
-    if settings.paid_promo_limit <= 0 or settings.paid_promo_days <= 0:
+    if settings.paid_promo_days <= 0:
         return 0
+    if settings.paid_promo_limit <= 0:  # без лимита
+        return 10 ** 9
     return max(0, settings.paid_promo_limit - db.paid_promo_count())
 
 
-def paid_promo_line() -> str:
-    left = paid_slots_left()
-    if not left:
+def paid_promo_eligible(tg_id: int | None) -> bool:
+    """Ещё не платил через бота и бонус не получал (tg_id=None — общий текст, без проверки человека)."""
+    if paid_slots_left() <= 0:
+        return False
+    if tg_id is None:
+        return True
+    return db.approved_payments_count(tg_id) == 0 and not db.has_paid_promo(tg_id)
+
+
+def paid_promo_line(tg_id: int | None = None) -> str:
+    if not paid_promo_eligible(tg_id):
         return ""
-    return (f"\n\n🏆 Первые <b>{settings.paid_promo_limit}</b> новых подписчиков, оплативших подписку, "
-            f"получают <b>+{settings.paid_promo_days} дн.</b> в подарок. Осталось мест: <b>{left}</b>")
+    line = (f"\n\n🎁 За <b>первую оплату через бота</b> — <b>+{settings.paid_promo_days} дн.</b> в подарок "
+            f"(при оплате от месяца).")
+    if settings.paid_promo_limit > 0:
+        line += f" Осталось мест: <b>{paid_slots_left()}</b>"
+    return line
 
 
 _DIGITS = "ноль один два три четыре пять шесть семь восемь девять".split()
@@ -93,33 +110,128 @@ def payment_details(tg_id: int | None = None) -> str:
 
 
 async def reward_first_paid(bot: Bot, target, tg_id: int, paid_days: int) -> None:
-    """После одобренного чека: новый подписчик (заведён ботом по заявке) из первых N получает +M дней."""
-    if (paid_slots_left() <= 0 or paid_days < settings.ref_min_paid_days
-            or tg_id in settings.admin_ids or not db.is_new_sub(tg_id)):
+    """После одобренного чека: если это ПЕРВЫЙ одобренный чек человека (на месяц и больше) — +M дней.
+    Любому клиенту: новому, нынешнему, бывшему. Вызывается после того, как чек уже отмечен одобренным."""
+    if (paid_slots_left() <= 0 or paid_days < settings.ref_min_paid_days or tg_id in settings.admin_ids
+            or db.approved_payments_count(tg_id) != 1):
+        return
+    user = await find_user(tg_id)
+    if not user:
+        await target.answer("⚠️ Бонус за первую оплату через бота не начислен: аккаунт не найден")
+        return
+    # Защита от повтора: бонус — один раз НА ПОДПИСКУ, а не на Telegram (второй Telegram к той же подписке не поможет)
+    panel_key = f"paid_promo_panel:{int(user['id'])}"
+    if db.kv_get(panel_key):
         return
     place = db.claim_paid_promo(tg_id, settings.paid_promo_limit)
     if not place:
         return
-    user = await find_user(tg_id)
+    db.kv_set(panel_key, str(tg_id))
     try:
-        if not user:
-            raise RemnawaveError(404, "аккаунт не найден")
         updated = await api.add_days(user, settings.paid_promo_days)
     except RemnawaveError as e:
         db.unclaim_paid_promo(tg_id)
-        await target.answer(f"⚠️ Бонус «первые {settings.paid_promo_limit}» не начислен: {esc(e)}")
+        db.kv_set(panel_key, "")
+        await target.answer(f"⚠️ Бонус за первую оплату через бота не начислен: {esc(e)}")
         return
-    n, limit, days = place, settings.paid_promo_limit, settings.paid_promo_days
+    days, limit = settings.paid_promo_days, settings.paid_promo_limit
     try:
-        await bot.send_message(tg_id, f"🏆 <b>Ты в числе первых {limit}!</b>\n"
-                                      f"Спасибо за оплату — держи <b>+{days} дн.</b> в подарок 🎁\n"
+        await bot.send_message(tg_id, f"🎁 <b>Бонус за первую оплату через бота!</b>\n"
+                                      f"Спасибо, что оплачиваешь здесь — держи <b>+{days} дн.</b> в подарок.\n"
                                       f"Подписка действует до <b>{esc((updated.get('expireAt') or '')[:10])}</b>.",
                                reply_markup=user_menu())
     except Exception:
         pass
-    await target.answer(f"🏆 Акция «первые {limit} оплативших»: <b>{n}/{limit}</b> — +{days} дн. для "
-                        f"<b>{esc(updated['username'])}</b>"
-                        + ("\n🏁 Все места разобраны, акция завершена." if n >= limit else ""))
+    await target.answer(f"🎁 Бонус за первую оплату через бота: +{days} дн. для <b>{esc(updated['username'])}</b>"
+                        + (f" ({place}/{limit})" if limit > 0 else ""))
+
+
+def _ts(iso: str | None) -> float:
+    if not iso:
+        return 0.0
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def loyalty_step(state: dict, months: int, on_time: bool) -> tuple[dict, int, int]:
+    """Чистая логика серии (без побочных эффектов). state = {"m": месяцев подряд, "g": выдано ступеней}.
+    Возвращает (новое состояние, бонус в днях, месяцев до следующей ступени; 0 — цикл закрыт)."""
+    tiers = settings.loyal_tiers
+    m, g = (state.get("m", 0), state.get("g", 0)) if on_time else (0, 0)
+    m += months
+    bonus = 0
+    while g < len(tiers) and m >= tiers[g][0]:
+        bonus += tiers[g][1]
+        g += 1
+    if g >= len(tiers):          # последняя ступень взята — цикл начинается заново
+        m, g = 0, 0
+        return {"m": m, "g": g}, bonus, 0
+    return {"m": m, "g": g}, bonus, tiers[g][0] - m
+
+
+def loyalty_hint(panel_id: int | None, expired: bool = False) -> str:
+    """Строка для напоминания: сколько будет месяцев подряд, если оплатить вовремя (месячный чек)."""
+    if not settings.loyal_tiers or panel_id is None:
+        return ""
+    try:
+        state = json.loads(db.kv_get(f"loyal:{int(panel_id)}") or "{}")
+    except ValueError:
+        state = {}
+    new, bonus, left = loyalty_step(state, 1, True)
+    n = state.get("m", 0) + 1
+    when = (f"в течение {settings.loyal_grace_hours} ч" if expired else "до окончания")
+    if bonus:
+        return f"\n\n🔥 Оплатишь {when} — это {n}-й месяц подряд и <b>+{bonus} дн.</b> в подарок."
+    if n == 1:
+        m1, d1 = settings.loyal_tiers[0]
+        return f"\n\n🔥 Платишь вовремя {m1} мес. подряд — <b>+{d1} дн.</b> в подарок."
+    return f"\n\n🔥 Оплатишь {when} — будет {n}-й месяц подряд, серия сохранится."
+
+
+_loyal_lock = asyncio.Lock()  # два чека одной подписки, одобренные одновременно, не дадут бонус дважды
+
+
+async def reward_loyalty(user_before: dict, updated: dict, tg_id: int, paid_days: int,
+                         submitted_at: int) -> tuple[dict, str, str]:
+    async with _loyal_lock:
+        return await _reward_loyalty(user_before, updated, tg_id, paid_days, submitted_at)
+
+
+async def _reward_loyalty(user_before: dict, updated: dict, tg_id: int, paid_days: int,
+                          submitted_at: int) -> tuple[dict, str, str]:
+    """Бонус за оплаты подряд. Вызывается сразу после продления по чеку.
+    «Вовремя» — чек отправлен, пока подписка ещё действовала (+ LOYAL_GRACE_HOURS).
+    Серия хранится НА ПОДПИСКУ (id в панели), не на Telegram.
+    Возвращает (подписка после бонуса, строка клиенту, строка админу)."""
+    months = paid_days // max(1, settings.ref_min_paid_days)
+    if not settings.loyal_tiers or months <= 0 or tg_id in settings.admin_ids:
+        return updated, "", ""
+    on_time = submitted_at <= _ts(user_before.get("expireAt")) + settings.loyal_grace_hours * 3600
+    key = f"loyal:{int(updated['id'])}"
+    try:
+        old = json.loads(db.kv_get(key) or "{}")
+    except ValueError:
+        old = {}
+    new, bonus, left = loyalty_step(old, months, on_time)
+    db.kv_set(key, json.dumps(new))
+    if bonus:
+        try:
+            updated = await api.add_days(updated, bonus)
+        except RemnawaveError as e:
+            db.kv_set(key, json.dumps(old))
+            return updated, "", f"⚠️ Бонус за оплаты подряд (+{bonus} дн.) не начислен: {esc(e)}"
+        until = esc((updated.get("expireAt") or "")[:10])
+        return (updated,
+                f"🔥 <b>Спасибо за верность!</b> Оплаты подряд — держи <b>+{bonus} дн.</b> в подарок. "
+                f"Подписка действует до <b>{until}</b>.",
+                f"🔥 Бонус за оплаты подряд: +{bonus} дн. для <b>{esc(updated['username'])}</b>")
+    nxt = next(d for mm, d in settings.loyal_tiers if mm > new["m"])
+    word = "месяц" if left == 1 else ("месяца" if left < 5 else "месяцев")
+    return (updated,
+            f"🔥 Оплат подряд: <b>{new['m']} мес.</b> Ещё {left} {word} без перерыва — и <b>+{nxt} дн.</b> в подарок.",
+            "")
 
 
 async def reward_first_verified(bot: Bot, tg_id: int, user: dict) -> bool:

@@ -86,6 +86,14 @@ class DB:
         for col, typ in (("tg_name", "TEXT"), ("username", "TEXT"), ("referrer_id", "INTEGER")):
             if col not in req_cols:
                 self.conn.execute(f"ALTER TABLE access_requests ADD COLUMN {col} {typ}")  # имена — константы
+        pay_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(payments)")}
+        if "file_unique" not in pay_cols:  # отпечаток файла чека — ловим повторную отправку того же PDF
+            self.conn.execute("ALTER TABLE payments ADD COLUMN file_unique TEXT")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS payments_file_unique ON payments(file_unique)")
+        for col, typ in (("sbp_id", "TEXT"), ("op_ts", "INTEGER")):  # из автопроверки чека
+            if col not in pay_cols:
+                self.conn.execute(f"ALTER TABLE payments ADD COLUMN {col} {typ}")  # имена — константы
+        self.conn.execute("CREATE INDEX IF NOT EXISTS payments_sbp_id ON payments(sbp_id)")
         self.conn.commit()
 
     # ---- заявки на доступ с выбранным именем и пригласившим ----
@@ -144,10 +152,14 @@ class DB:
         return self.conn.execute("SELECT 1 FROM new_subs WHERE tg_id=?", (tg_id,)).fetchone() is not None
 
     def claim_paid_promo(self, tg_id: int, limit: int) -> int | None:
-        """Атомарно: номер места (1..limit) или None (мест нет / уже получал)."""
-        cur = self.conn.execute(
-            "INSERT OR IGNORE INTO paid_promo(tg_id, created_at) SELECT ?, ? WHERE (SELECT COUNT(*) FROM paid_promo) < ?",
-            (tg_id, int(time.time()), limit))
+        """Атомарно: номер по счёту или None (уже получал / мест нет). limit <= 0 — без лимита."""
+        if limit <= 0:
+            cur = self.conn.execute("INSERT OR IGNORE INTO paid_promo(tg_id, created_at) VALUES(?, ?)",
+                                    (tg_id, int(time.time())))
+        else:
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO paid_promo(tg_id, created_at) SELECT ?, ? WHERE (SELECT COUNT(*) FROM paid_promo) < ?",
+                (tg_id, int(time.time()), limit))
         self.conn.commit()
         if cur.rowcount != 1:
             return None
@@ -159,6 +171,13 @@ class DB:
 
     def paid_promo_count(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM paid_promo").fetchone()[0]
+
+    def has_paid_promo(self, tg_id: int) -> bool:
+        return self.conn.execute("SELECT 1 FROM paid_promo WHERE tg_id=?", (tg_id,)).fetchone() is not None
+
+    def approved_payments_count(self, tg_id: int) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM payments WHERE tg_id=? AND status='approved'",
+                                 (tg_id,)).fetchone()[0]
 
     def linked_tg_ids(self) -> list[int]:
         return [r[0] for r in self.conn.execute("SELECT tg_id FROM links")]
@@ -297,13 +316,33 @@ class DB:
         self.conn.commit()
 
     # ---- чеки ----
-    def add_payment(self, tg_id: int, tg_name: str, file_id: str, file_name: str | None) -> int:
+    def add_payment(self, tg_id: int, tg_name: str, file_id: str, file_name: str | None,
+                    file_unique: str | None = None) -> int:
         cur = self.conn.execute(
-            "INSERT INTO payments(tg_id, tg_name, file_id, file_name, created_at) VALUES(?,?,?,?,?)",
-            (tg_id, tg_name, file_id, file_name, int(time.time())),
+            "INSERT INTO payments(tg_id, tg_name, file_id, file_name, created_at, file_unique) VALUES(?,?,?,?,?,?)",
+            (tg_id, tg_name, file_id, file_name, int(time.time()), file_unique),
         )
         self.conn.commit()
         return cur.lastrowid
+
+    def payment_by_sbp(self, sbp_id: str, exclude_pid: int) -> int | None:
+        """Чек с той же операцией СБП (повтор оплаты даже в другом файле), кроме отклонённых."""
+        row = self.conn.execute("SELECT id FROM payments WHERE sbp_id=? AND id<>? AND status<>'rejected' ORDER BY id",
+                                (sbp_id, exclude_pid)).fetchone()
+        return row["id"] if row else None
+
+    def set_payment_check(self, pid: int, sbp_id: str | None, op_ts: float | None) -> None:
+        self.conn.execute("UPDATE payments SET sbp_id=?, op_ts=? WHERE id=?",
+                          (sbp_id, int(op_ts) if op_ts else None, pid))
+        self.conn.commit()
+
+    def same_file_payments(self, file_unique: str | None, exclude_pid: int) -> list[sqlite3.Row]:
+        """Чеки с тем же файлом (повторная отправка одного PDF — от того же или другого человека)."""
+        if not file_unique:
+            return []
+        return self.conn.execute(
+            "SELECT id, tg_id, status, created_at FROM payments WHERE file_unique=? AND id<>? ORDER BY id",
+            (file_unique, exclude_pid)).fetchall()
 
     def get_payment(self, pid: int) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM payments WHERE id=?", (pid,)).fetchone()
@@ -335,6 +374,9 @@ class DB:
         if not row or row["expire_at"] != expire_at:
             return 0  # срок поменялся (продлили) — начинаем цикл напоминаний заново
         return row["stage"]
+
+    def reminder_row(self, tg_id: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM reminders WHERE tg_id=?", (tg_id,)).fetchone()
 
     def reminder_msg(self, tg_id: int) -> int | None:
         row = self.conn.execute("SELECT msg_id FROM reminders WHERE tg_id=?", (tg_id,)).fetchone()

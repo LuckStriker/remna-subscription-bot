@@ -51,8 +51,10 @@ class Settings:
     bday_gift_days: int
     first_promo_limit: int  # сколько первых верифицированных получают бонус (0 — акция выключена)
     first_promo_days: int
-    paid_promo_limit: int   # первые N НОВЫХ подписчиков, чей чек одобрен, получают +M дней (0 — выключено)
-    paid_promo_days: int
+    paid_promo_limit: int   # бонус за ПЕРВЫЙ одобренный чек через бота: сколько человек максимум (0 — без лимита)
+    paid_promo_days: int    # сколько дней дарить за первую оплату через бота (0 — бонус выключен)
+    loyal_tiers: tuple      # бонус за оплаты подряд: ((месяцев, дней), ...), напр. 3:7,6:14; пусто — выключено
+    loyal_grace_hours: int  # сколько часов после окончания чек ещё считается «вовремя»
     pay_bank: str           # реквизиты для оплаты (СБП)
     pay_phone: str
     pay_name: str
@@ -75,7 +77,8 @@ class Settings:
     bot_name: str
     welcome_text: str
     welcome_delete_after: int  # минуты, 0 — не удалять
-    remind_hours: list[int]    # за сколько часов до конца напоминать
+    remind_hours: list[int]    # за сколько часов до конца напоминать (днём, 10–21 МСК)
+    remind_after_hours: int    # одно догоняющее напоминание через N часов после окончания (0 — не напоминать)
     chat_autoclean_hours: int  # через сколько часов чистить переписку пользователей, 0 — не чистить
 
 
@@ -116,8 +119,11 @@ def load_settings() -> Settings:
         bday_gift_days=int(os.getenv("BDAY_GIFT_DAYS", "14")),
         first_promo_limit=int(os.getenv("FIRST_PROMO_LIMIT", "20")),
         first_promo_days=int(os.getenv("FIRST_PROMO_DAYS", "7")),
-        paid_promo_limit=int(os.getenv("PAID_PROMO_LIMIT", "30")),
+        paid_promo_limit=int(os.getenv("PAID_PROMO_LIMIT", "0")),
         paid_promo_days=int(os.getenv("PAID_PROMO_DAYS", "7")),
+        loyal_tiers=tuple(sorted((int(m), int(d)) for m, d in
+                                 (x.split(":") for x in os.getenv("LOYAL_TIERS", "3:7,6:14").replace(" ", "").split(",") if x))),
+        loyal_grace_hours=int(os.getenv("LOYAL_GRACE_HOURS", "72")),
         pay_bank=os.getenv("PAY_BANK", "").strip(),
         pay_phone=os.getenv("PAY_PHONE", "").strip(),
         pay_name=os.getenv("PAY_NAME", "").strip(),
@@ -143,7 +149,8 @@ def load_settings() -> Settings:
             "Здесь мы публикуем новости и акции и предупреждаем о технических работах.\n"
             "Уже есть подписка — привяжи её. Нужен доступ — жми кнопку ниже."),
         welcome_delete_after=int(os.getenv("WELCOME_DELETE_AFTER", "10")),
-        remind_hours=sorted({h for h in _int_list(os.getenv("REMIND_HOURS", "24,12,1")) if h > 0}, reverse=True),
+        remind_hours=sorted({h for h in _int_list(os.getenv("REMIND_HOURS", "72,24,6")) if h > 0}, reverse=True),
+        remind_after_hours=max(0, int(os.getenv("REMIND_AFTER_HOURS", "72"))),
         # Telegram позволяет боту удалять сообщения только моложе 48 часов
         chat_autoclean_hours=min(int(os.getenv("CHAT_AUTOCLEAN_HOURS", "24")), 47),
     )

@@ -1,6 +1,7 @@
 """Общие объекты (API, БД) и помощники, которые используют все хендлеры."""
 import html
 import io
+import json
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -182,6 +183,19 @@ def days_left(user: dict) -> float:
     return (exp - datetime.now(timezone.utc)).total_seconds() / 86400
 
 
+def loyalty_line(panel_id) -> str:
+    """«🔥 Оплат подряд: 2 мес. — ещё 1 до +7 дн.» для профиля (клиенту и в карточке админа)."""
+    tiers = settings.loyal_tiers
+    if not tiers or panel_id is None:
+        return ""
+    try:
+        m = int(json.loads(db.kv_get(f"loyal:{int(panel_id)}") or "{}").get("m", 0))
+    except (ValueError, TypeError, AttributeError):
+        m = 0
+    nxt = next(((mm, d) for mm, d in tiers if mm > m), tiers[0])
+    return f"🔥 Оплат подряд: <b>{m} мес.</b> — ещё {nxt[0] - m} до <b>+{nxt[1]} дн.</b>"
+
+
 async def profile_text(user: dict, for_admin: bool = False) -> str:
     exp = parse_dt(user.get("expireAt"))
     left = days_left(user)
@@ -213,6 +227,9 @@ async def profile_text(user: dict, for_admin: bool = False) -> str:
         f"📊 Трафик: <b>{traffic_txt}</b>",
         f"📱 Устройства: <b>{dev_txt}</b>",
     ]
+    streak = loyalty_line(user.get("id"))
+    if streak:
+        lines.append(streak)
     if for_admin:
         lines.append(f"🆔 id панели: <code>{user.get('id')}</code>, Telegram: <code>{tg_of(user) or '—'}</code>")
         squads = ", ".join(esc(s.get("name")) for s in user.get("activeInternalSquads") or []) or "—"

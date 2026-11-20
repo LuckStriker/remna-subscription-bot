@@ -15,9 +15,10 @@ from core import (api, db, esc, lock_price, price_for, find_by_name_or_link, fin
                   profile_text, qr_file, resolve_target,
                   tg_of, unlinked_users, username_for, valid_username)
 from keyboards import (AdminMenu, LinkCb, NodeCb, PayCb, ReqCb, SquadCb, UserCb, UserMenu, admin_menu,
-                       back_to_admin, cancel_kb, kb, payment_kb, user_card_kb, user_menu)
+                       back_to_admin, cancel_kb, kb, payment_kb, reject_kb, user_card_kb, user_menu,
+                       REJECT_REASONS)
 from remnawave import RemnawaveError, human_bytes
-from promo import paid_promo_line, payment_details, reward_first_paid, reward_first_verified
+from promo import paid_promo_line, payment_details, reward_first_paid, reward_first_verified, reward_loyalty
 from tracking import clean_chat
 
 router = Router()
@@ -53,6 +54,7 @@ class CustomDays(StatesGroup):
     payment = State()  # своё кол-во дней по чеку
     user = State()     # ± дни из карточки пользователя
     amount = State()   # сумма из чека → дни по тарифу клиента
+    reject = State()   # своя причина отказа по чеку
 
 
 async def notify(bot: Bot, tg_id: int | None, text: str, **kw) -> None:
@@ -316,7 +318,7 @@ async def do_create(target: Message, bot: Bot, tg_id: int, days: int, traffic: i
                      "«💳 Оплатить / продлить» — после проверки доступ включится.", reply_markup=user_menu())
         return user
     await notify(bot, tg_id, f"🎉 <b>Доступ открыт!</b>\nПодписка активна {days} дн.\n"
-                             "Нажмите «🖼 QR-код», чтобы подключиться." + paid_promo_line(), reply_markup=user_menu())
+                             "Нажмите «🖼 QR-код», чтобы подключиться." + paid_promo_line(tg_id), reply_markup=user_menu())
     if settings.bday_gift_days > 0 and not (db.get_birthday(tg_id) or {"day": None})["day"]:
         db.kv_set(f"bday_nag:{tg_id}", f"0,{int(time.time())}")
         await notify(bot, tg_id, f"🎂 Кстати, укажи свой день рождения — в этот день подарю "
@@ -699,10 +701,14 @@ async def approve_payment(target: Message, bot: Bot, pid: int, days: int, admin_
         db.reopen_payment(pid)
         await target.answer(f"💥 Панель вернула ошибку, чек возвращён в очередь: {esc(e)}")
         return
+    paid_until = esc((updated.get('expireAt') or '')[:10])
+    updated, loyal_user, loyal_admin = await reward_loyalty(user, updated, p["tg_id"], days, p["created_at"])
     await target.answer(f"✅ Чек #{pid} принят: +{days} дн. для {esc(updated['username'])}, "
-                        f"до {esc((updated.get('expireAt') or '')[:10])}.")
+                        f"до {esc((updated.get('expireAt') or '')[:10])}."
+                        + (f"\n{loyal_admin}" if loyal_admin else ""))
     await notify(bot, p["tg_id"], f"✅ <b>Оплата подтверждена!</b>\nПодписка продлена на {days} дн., "
-                                  f"действует до {esc((updated.get('expireAt') or '')[:10])}."
+                                  f"действует до {paid_until}."
+                                  + (f"\n\n{loyal_user}" if loyal_user else "")
                                   + (f"\n\n{warn}" if warn else ""),
                  reply_markup=user_menu())
     await reward_referral(target, bot, p["tg_id"], days)
@@ -730,12 +736,50 @@ async def cb_payment(cb: CallbackQuery, callback_data: PayCb, state: FSMContext,
         await state.update_data(pid=pid)
         await cb.message.answer(f"Сколько ₽ пришло по чеку #{pid}? Тариф клиента — <b>{tariff} ₽</b> за 31 день "
                                 f"(≈ {tariff / 31:.2f} ₽/день). Дни посчитаю сам.", reply_markup=cancel_kb())
-    elif callback_data.action == "no":
-        if db.decide_payment(pid, "rejected", cb.from_user.id):
-            await cb.message.edit_reply_markup(reply_markup=None)
-            await cb.message.answer(f"❌ Чек #{pid} отклонён.")
-            await notify(bot, p["tg_id"], "❌ Чек не принят. Если это ошибка — свяжитесь с администратором "
-                                          "или отправьте корректный чек ещё раз.", reply_markup=user_menu())
+    elif callback_data.action == "no":  # сначала — выбрать причину, клиент должен понимать, что не так
+        await cb.message.edit_reply_markup(reply_markup=reject_kb(pid))
+    elif callback_data.action == "back":
+        await cb.message.edit_reply_markup(reply_markup=payment_kb(pid))
+    elif callback_data.action == "rej":
+        if not 0 <= callback_data.days < len(REJECT_REASONS):
+            return
+        btn, why = REJECT_REASONS[callback_data.days]
+        await reject_payment(cb.message, bot, p, cb.from_user.id, why, btn)
+    elif callback_data.action == "rejtxt":
+        await state.set_state(CustomDays.reject)
+        await state.update_data(pid=pid, src=cb.message.message_id)
+        await cb.message.answer(f"✍️ Напиши причину отказа по чеку #{pid} — клиент получит её как есть.",
+                                reply_markup=cancel_kb())
+
+
+async def reject_payment(target: Message, bot: Bot, p, admin_id: int, why: str, label: str) -> None:
+    pid = p["id"]
+    if not db.decide_payment(pid, "rejected", admin_id):
+        await target.answer("⚠️ Этот чек уже обработан.")
+        return
+    try:
+        await target.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await target.answer(f"❌ Чек #{pid} отклонён: {esc(label)}. Клиенту отправлено объяснение.")
+    await notify(bot, p["tg_id"], f"❌ <b>Чек не принят.</b>\n\n{why}\n\n"
+                                  f"Если считаете, что это ошибка, — напишите администратору.",
+                 reply_markup=user_menu())
+
+
+@router.message(CustomDays.reject, F.text, ~F.text.startswith("/"))
+async def custom_reject_reason(msg: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    await state.clear()
+    p = db.get_payment(data["pid"])
+    if not p or p["status"] != "pending":
+        return await msg.answer("⚠️ Этот чек уже обработан.")
+    text = " ".join(msg.text.split())[:500]
+    try:
+        await bot.edit_message_reply_markup(chat_id=msg.chat.id, message_id=data["src"], reply_markup=None)
+    except Exception:
+        pass
+    await reject_payment(msg, bot, p, msg.from_user.id, f"Причина: {esc(text)}", "своя причина")
 
 
 @router.message(CustomDays.payment)

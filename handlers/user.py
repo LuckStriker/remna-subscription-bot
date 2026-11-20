@@ -1,7 +1,10 @@
 """Сценарии обычного пользователя: профиль, QR, устройства, отправка чека, заявка на доступ."""
+import io
 import logging
 import re
 import time
+
+import receipts
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
@@ -68,12 +71,12 @@ async def cmd_start(msg: Message, state: FSMContext, command: CommandObject | No
         if ref:
             return await msg.answer(
                 f"🤝 Привет! Тебя пригласил друг — <b>{esc(ref['username'])}</b>.\n\n"
-                f"Я {esc(settings.bot_name)} 🤖, помогу с подпиской. Нажми «🔑 Запросить доступ», придумай себе имя — "
+                f"Я {esc(settings.bot_name)} 🤖. Нажми «🔑 Запросить доступ», придумай себе имя — "
                 f"и после одобрения получишь <b>{settings.ref_trial_days} дн.</b> на знакомство."
                 + (f"\n\n🎁 А когда оплатишь месяц, тебе и другу начислится по "
                    f"<b>+{settings.ref_paid_bonus_days} дн.</b>" if settings.ref_paid_bonus_days > 0 else "")
                 + "\n\n<i>Бонусы — только для новых. Если ты уже был нашим клиентом, аккаунт заведём заново, "
-                  "но без бонусных дней.</i>" + paid_promo_line(),
+                  "но без бонусных дней.</i>" + paid_promo_line(msg.from_user.id),
                 reply_markup=user_menu(registered=False))
     await msg.answer(
         f"🔒 Ваш Telegram пока не привязан к подписке.\n"
@@ -83,7 +86,7 @@ async def cmd_start(msg: Message, state: FSMContext, command: CommandObject | No
         f"• Новый пользователь? Нажмите «🔑 Запросить доступ»."
         + (f"\n\n🏆 Первые {settings.first_promo_limit}, кто привяжет подписку, получают "
            f"<b>+{settings.first_promo_days} дн.</b> Осталось мест: <b>{promo_slots_left()}</b>"
-           if promo_slots_left() > 0 else "") + paid_promo_line(),
+           if promo_slots_left() > 0 else "") + paid_promo_line(msg.from_user.id),
         reply_markup=user_menu(registered=False))
 
 
@@ -385,8 +388,12 @@ async def cb_pay(cb: CallbackQuery, state: FSMContext):
     if settings.pay_phone:
         rows.append([Btn(text="📋 Скопировать телефон", copy_text=CopyTextButton(text=settings.pay_phone))])
     rows.append([Btn(text="⬅️ Меню", callback_data=UserMenu(action="menu").pack())])
-    await cb.message.answer(f"💳 {payment_details(cb.from_user.id)}\n\n📎 После оплаты пришлите чек из банка <b>PDF-файлом</b> "
-                            f"в этот чат.", reply_markup=kb(*rows))
+    await cb.message.answer(f"💳 {payment_details(cb.from_user.id)}\n\n"
+                            f"🗓 <b>Оплачивайте в день окончания подписки и сразу присылайте чек.</b>\n"
+                            f"Платите заранее — добавьте к чеку подпись «наперёд», чтобы админ знал. "
+                            f"Дни не сгорают: продление добавится к концу текущего срока.\n\n"
+                            f"📎 После оплаты пришлите чек из банка <b>PDF-файлом</b> "
+                            f"в этот чат." + paid_promo_line(cb.from_user.id), reply_markup=kb(*rows))
 
 
 @router.message(F.document, ~F.from_user.id.in_(settings.admin_ids))
@@ -408,18 +415,31 @@ async def on_document(msg: Message, bot: Bot, state: FSMContext):
         return await msg.answer("⏳ Предыдущий чек ещё на проверке.")
 
     await state.clear()
-    pid = db.add_payment(msg.from_user.id, msg.from_user.full_name, doc.file_id, doc.file_name)
+    pid = db.add_payment(msg.from_user.id, msg.from_user.full_name, doc.file_id, doc.file_name, doc.file_unique_id)
+    dups = db.same_file_payments(doc.file_unique_id, pid)
+    status_ru = {"approved": "принят", "rejected": "отклонён", "pending": "на проверке"}
+    dup_note = ("\n\n🚨 <b>ЭТОТ ЖЕ ФАЙЛ УЖЕ ПРИСЫЛАЛИ:</b> "
+                + "; ".join(f"чек #{d['id']} ({status_ru.get(d['status'], d['status'])}"
+                            + ("" if d["tg_id"] == msg.from_user.id else f", другой Telegram <code>{d['tg_id']}</code>")
+                            + ")" for d in dups[-3:])
+                + "\nПроверь, что это новая оплата.") if dups else ""
     caption = (f"🧾 <b>Чек #{pid}</b>\n"
                f"От: {esc(msg.from_user.full_name)} (@{esc(msg.from_user.username or '—')})\n"
                f"Telegram ID: <code>{msg.from_user.id}</code>\n"
                f"Аккаунт: <code>{esc(user['username'])}</code>, до {esc((user.get('expireAt') or '')[:10])}\n"
                f"Тариф клиента: <b>{price_for(msg.from_user.id)} ₽</b>"
-               + (" 🔒 (закреплён)" if db.kv_get(f"price_lock:{msg.from_user.id}") else ""))
-    delivered = 0
+               + (" 🔒 (закреплён)" if db.kv_get(f"price_lock:{msg.from_user.id}") else "")
+               + dup_note)
+    # подпись клиента («наперёд» и т.п.) — короткой строкой; лимит подписи к файлу в Telegram 1024 символа
+    note = " ".join((msg.caption or "").split())[:150]
+    if note:
+        with_note = caption + f"\n💬 Подпись клиента: <i>{esc(note)}</i>"
+        caption = with_note if len(with_note) <= 1000 else caption + "\n💬 Клиент добавил подпись, но она не поместилась — спроси у него"
+    delivered = []
     for admin_id in settings.admin_ids:
         try:
-            await bot.send_document(admin_id, doc.file_id, caption=caption, reply_markup=payment_kb(pid))
-            delivered += 1
+            m = await bot.send_document(admin_id, doc.file_id, caption=caption, reply_markup=payment_kb(pid))
+            delivered.append(m)
         except Exception as e:
             log.warning("Не удалось отправить чек админу %s: %s", admin_id, e)
     if not delivered:
@@ -427,6 +447,31 @@ async def on_document(msg: Message, bot: Bot, state: FSMContext):
         return await msg.answer("💥 Не удалось передать чек администратору, попробуйте позже.")
     await msg.answer("✅ Чек получен и отправлен на проверку. Я напишу, как только администратор примет решение.\n\n"
                      f"⏳ {processing_note()}", reply_markup=user_menu())
+    await _auto_check(bot, pid, msg.from_user.id, doc, delivered)
+
+
+async def _auto_check(bot: Bot, pid: int, tg_id: int, doc, admin_msgs: list) -> None:
+    """Помощник проверки: читает дату/сумму/получателя из PDF и отвечает админу под чеком. Клиент этого не видит.
+    Любая ошибка здесь не мешает чеку — админ просто проверит вручную."""
+    report = None
+    try:
+        buf = io.BytesIO()
+        await bot.download(doc, destination=buf)
+        pay10 = "".join(ch for ch in settings.pay_phone if ch.isdigit())[-10:]
+        parsed = await receipts.check(buf.getvalue(), pay10)
+        dup_pid = None
+        if parsed and parsed.get("sbp_id"):
+            dup_pid = db.payment_by_sbp(parsed["sbp_id"], pid)
+            db.set_payment_check(pid, parsed["sbp_id"], parsed.get("op_ts"))
+        report = receipts.assess(parsed, price_for(tg_id), time.time(), dup_pid)
+    except Exception as e:
+        log.warning("Автопроверка чека #%s не удалась: %s", pid, e)
+        report = "🤖 <b>Проверка чека:</b> не получилось — проверь вручную."
+    for m in admin_msgs:
+        try:
+            await bot.send_message(m.chat.id, report, reply_to_message_id=m.message_id)
+        except Exception as e:
+            log.warning("Не удалось отправить отчёт проверки чека #%s: %s", pid, e)
 
 
 @router.message(PayStates.waiting_receipt)

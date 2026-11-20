@@ -12,23 +12,104 @@ from core import api, db, esc, find_user, tg_of
 from aiogram.types import InlineKeyboardButton as Btn
 
 from keyboards import UserCb, UserMenu, kb, user_menu
-from promo import processing_note
+from promo import loyalty_hint, paid_promo_line, processing_note
 from remnawave import parse_dt
 
 log = logging.getLogger(__name__)
 
+MSK = timezone(timedelta(hours=3))
+DAY_FROM, DAY_TO = 10, 21  # напоминания клиентам — только днём по МСК, ночью не беспокоим
+
+
+def now_utc() -> datetime:  # отдельной функцией — чтобы в тестах подменять время
+    return datetime.now(timezone.utc)
+
+
+def _daytime() -> bool:
+    return DAY_FROM <= now_utc().astimezone(MSK).hour < DAY_TO
+
 
 def _stages() -> list[tuple[float, int, str]]:
-    """(порог в часах, номер этапа, текст) — от дальнего к ближнему; последний этап — «истекла»."""
-    out = []
-    for i, h in enumerate(settings.remind_hours, 1):
-        when = f"{h // 24} дн." if h % 24 == 0 and h >= 48 else ("сутки" if h == 24 else f"{h} ч.")
-        out.append((h, i, f"⏳ Подписка заканчивается через {when}\n"
-                          f"Чтобы доступ не отключился, оплатите и отправьте чек кнопкой «💳 Оплатить / продлить» "
-                          f"(там же реквизиты).\n\n💡 {processing_note()}"))
-    out.append((0, len(out) + 1, "🔴 Подписка закончилась. Отправьте чек об оплате — после проверки доступ вернётся.\n\n"
-                                 f"💡 {processing_note()}"))
+    """(порог в часах до конца, номер этапа, вид) — от дальнего к ближнему.
+    До окончания — по REMIND_HOURS (по умолчанию 72,24,6), затем «закончилась», затем одно догоняющее."""
+    out = [(h, i, "before") for i, h in enumerate(settings.remind_hours, 1)]
+    out.append((0, len(out) + 1, "expired"))
+    if settings.remind_after_hours > 0:
+        out.append((-settings.remind_after_hours, len(out) + 1, "followup"))
     return out
+
+
+def _bday_hint(tg_id: int, exp: datetime) -> str:
+    """ДР выпадает ПОСЛЕ окончания подписки (в пределах 2 недель) и подарок положен — намекнуть продлить.
+    Правила те же, что у подарка: дата указана ≥30 дней назад или есть исключение, в этом году ещё не дарили."""
+    if settings.bday_gift_days <= 0:
+        return ""
+    row = db.get_birthday(tg_id)
+    if not row or not row["day"] or not row["month"]:
+        return ""
+    end = exp.astimezone(MSK).date()
+    for year in (end.year, end.year + 1):
+        try:
+            bday = datetime(year, row["month"], row["day"]).date()
+        except ValueError:  # 29.02 в невисокосный год
+            bday = datetime(year, 2, 28).date()
+        if bday > end:
+            break
+    if not end < bday <= end + timedelta(days=14) or (row["last_gift_year"] or 0) >= bday.year:
+        return ""
+    exception = db.kv_get(f"bday_exception:{tg_id}") == str(bday.year)
+    set_ok = datetime.fromtimestamp(row["set_at"], timezone.utc).date() <= bday - timedelta(days=30)
+    if not (exception or set_ok):
+        return ""
+    return (f"\n\n🎂 Кстати, {bday:%d.%m} у тебя день рождения — продли подписку, и в этот день "
+            f"я подарю тебе <b>+{settings.bday_gift_days} дн.</b> 🎁")
+
+
+def _reminder_text(kind: str, exp: datetime, hours: float, tg_id: int, panel_id: int | None = None) -> str:
+    local = exp.astimezone(MSK)
+    today = now_utc().astimezone(MSK).date()
+    pay = "Оплатить и прислать чек можно прямо здесь — кнопка «💳 Оплатить / продлить»." + _bday_hint(tg_id, exp)
+    if kind == "before":
+        if local.date() == today:
+            head = f"⏰ <b>Подписка заканчивается сегодня в {local:%H:%M}</b> (МСК)"
+        elif local.date() == today + timedelta(days=1):
+            head = f"⏳ <b>Подписка заканчивается завтра в {local:%H:%M}</b> (МСК)"
+        else:
+            head = f"⏳ <b>Подписка заканчивается через {(local.date() - today).days} дн.</b> — {local:%d.%m}"
+        return (f"{head}\n{pay}\n\n💡 {processing_note()}" + paid_promo_line(tg_id)
+                + loyalty_hint(panel_id))
+    if kind == "expired":
+        return (f"🔴 <b>Подписка закончилась</b> ({local:%d.%m %H:%M} МСК)\n"
+                f"Оплатите и пришлите чек — после проверки доступ вернётся.\n{pay}\n\n💡 {processing_note()}"
+                + paid_promo_line(tg_id) + loyalty_hint(panel_id, expired=True))
+    days_ago = max(1, round(-hours / 24))
+    return (f"👋 Подписка закончилась {days_ago} дн. назад.\n"
+            f"Захотите вернуться — оплата и чек в одну кнопку, доступ включится после проверки."
+            + paid_promo_line(tg_id))
+
+
+async def _retire(bot: Bot, chat_id: int, msg_id: int | None, text: str | None = None) -> None:
+    """Старое напоминание: открепить; удалить (Telegram даёт удалять только моложе 48 ч) или переписать."""
+    if not msg_id:
+        return
+    try:
+        await bot.unpin_chat_message(chat_id, message_id=msg_id)
+    except Exception:
+        pass
+    if text:
+        try:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id)
+            return
+        except Exception:
+            pass
+    try:
+        await bot.delete_message(chat_id, msg_id)
+    except Exception:
+        try:
+            await bot.edit_message_text("⏳ Напоминание обновлено — актуальное закреплено вверху чата.",
+                                        chat_id=chat_id, message_id=msg_id)
+        except Exception:
+            pass
 
 
 async def _alert_admin_unlinked(bot: Bot, user: dict, hours: float) -> None:
@@ -59,9 +140,12 @@ async def _alert_admin_unlinked(bot: Bot, user: dict, hours: float) -> None:
 
 
 async def check_once(bot: Bot) -> None:
-    now = datetime.now(timezone.utc)
+    """Напоминания об окончании: одно актуальное сообщение, закреплено вверху чата, автоочистка его не трогает.
+    Новый этап — новое сообщение (с уведомлением), старое убирается. Продлили — сообщение становится «✅ продлено»."""
+    now = now_utc()
     stages = _stages()
-    top = stages[0][0]
+    top, last_limit = stages[0][0], stages[-1][0]
+    daytime = _daytime()
     async for user in api.iter_users():
         tg_id = tg_of(user)
         exp = parse_dt(user.get("expireAt"))
@@ -71,26 +155,68 @@ async def check_once(bot: Bot) -> None:
         if not tg_id:
             await _alert_admin_unlinked(bot, user, hours)
             continue
-        if hours > top or hours < -72:  # далеко до конца или давно истекла
+        row = db.reminder_row(tg_id)
+        # Продлили (срок сменился и он в будущем) — висящее напоминание превращаем в «✅ продлено» и открепляем
+        if row and row["msg_id"] and row["expire_at"] != user["expireAt"] and hours > 0:
+            await _retire(bot, tg_id, row["msg_id"],
+                          f"✅ <b>Подписка продлена</b> до {exp.astimezone(MSK):%d.%m.%Y}. Спасибо!")
+            db.set_reminder_stage(tg_id, user["expireAt"], 0, None)
+            row = None
+        if hours > top or hours < last_limit - 72:  # далеко до конца или догоняющее уже позади
             continue
-        # Наиболее «поздний» этап, порог которого уже пройден (промежуточные пропускаем — без спама)
-        stage, text = next(((st, tx) for limit, st, tx in reversed(stages) if hours <= limit), (0, ""))
+        if not daytime:  # ночью не пишем: этап дождётся 10:00
+            continue
+        # Наиболее «поздний» пройденный этап (промежуточные пропускаем — без спама)
+        stage, kind = next(((st, kd) for limit, st, kd in reversed(stages) if hours <= limit), (0, ""))
         if not stage or stage <= db.reminder_stage(tg_id, user["expireAt"]):
             continue
-        old = db.reminder_msg(tg_id)
-        if old:  # предыдущее напоминание убираем — в чате всегда только одно
-            try:
-                await bot.delete_message(tg_id, old)
-            except Exception:
-                pass
-        msg_id = None
         try:
-            m = await bot.send_message(tg_id, text, reply_markup=user_menu())
-            msg_id = m.message_id
+            m = await bot.send_message(tg_id, _reminder_text(kind, exp, hours, tg_id, user.get("id")), reply_markup=user_menu())
         except Exception as e:
             log.info("Напоминание %s не доставлено: %s", tg_id, e)
-        db.set_reminder_stage(tg_id, user["expireAt"], stage, msg_id)
+            db.set_reminder_stage(tg_id, user["expireAt"], stage, row["msg_id"] if row else None)
+            continue
+        db.untrack_msg(tg_id, m.message_id)  # не даём автоочистке удалить напоминание через сутки
+        try:
+            await bot.pin_chat_message(tg_id, m.message_id, disable_notification=True)
+        except Exception:
+            pass
+        await _retire(bot, tg_id, row["msg_id"] if row else None)
+        db.set_reminder_stage(tg_id, user["expireAt"], stage, m.message_id)
         await asyncio.sleep(0.05)  # бережём лимиты Telegram
+
+
+async def admin_digest_once(bot: Bot) -> None:
+    """Раз в день утром — админу: кто заканчивается в ближайшие 3 дня и кто закончился за неделю и не продлил."""
+    local = now_utc().astimezone(MSK)
+    if not 10 <= local.hour < 12 or db.kv_get("admin_digest_day") == local.strftime("%Y-%m-%d"):
+        return
+    db.kv_set("admin_digest_day", local.strftime("%Y-%m-%d"))
+    soon, gone = [], []
+    async for user in api.iter_users():
+        exp = parse_dt(user.get("expireAt"))
+        if not exp or user.get("status") == "DISABLED":
+            continue
+        hours = (exp - now_utc()).total_seconds() / 3600
+        tg = "" if tg_of(user) else " · <i>без Telegram</i>"
+        line = f"• <b>{esc(user['username'])}</b> — {exp.astimezone(MSK):%d.%m %H:%M}{tg}"
+        if 0 < hours <= 72:
+            soon.append((hours, line))
+        elif -168 <= hours <= 0:
+            gone.append((hours, line))
+    if not soon and not gone:
+        return
+    text = "☀️ <b>Сводка по подпискам</b>"
+    if soon:
+        text += "\n\n⏳ Заканчиваются в ближайшие 3 дня:\n" + "\n".join(l for _, l in sorted(soon))
+    if gone:
+        text += "\n\n🔴 Закончились за неделю и не продлены:\n" + "\n".join(l for _, l in sorted(gone, reverse=True))
+    text += "\n\n<i>Личное «привет, продлеваешь?» работает лучше любого напоминания.</i>"
+    for admin_id in settings.admin_ids:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception:
+            pass
 
 
 async def delete_many(bot: Bot, chat_id: int, ids: list[int]) -> None:
@@ -110,7 +236,6 @@ async def autoclean_once(bot: Bot) -> None:
     db.take_msgs(older_than=48 * 3600)  # старше 48 ч Telegram удалить уже не даст — просто забываем
 
 
-MSK = timezone(timedelta(hours=3))
 BDAY_MIN_AGE = 30 * 86400  # дату нужно указать минимум за 30 дней — иначе можно «назначить» ДР на сегодня
 
 
@@ -144,16 +269,17 @@ async def birthdays_once(bot: Bot) -> None:
             except Exception as e:
                 log.warning("ДР-подарок %s не начислен: %s", tg_id, e)
                 continue
+            until = parse_dt(updated.get("expireAt"))
             text = (f"🎂 <b>С днём рождения!</b>\n\n"
-                    f"От всей нашей команды — счастья, здоровья и всего самого лучшего 🎉\n"
-                    f"В подарок к подписке добавлено <b>+{settings.bday_gift_days} дн.</b> 🎁\n"
-                    f"Теперь она действует до <b>{(updated.get('expireAt') or '')[:10]}</b>.")
+                    f"Желаю счастья, здоровья и чтобы всё летало 🤖\n"
+                    f"Дарю тебе <b>+{settings.bday_gift_days} дн.</b> к подписке 🎁"
+                    + (f" — теперь она действует до <b>{until.astimezone(MSK):%d.%m.%Y}</b>." if until else "."))
             admin_note = f"🎂 Сегодня ДР у <b>{esc(user['username'])}</b> — подарено +{settings.bday_gift_days} дн."
             if exception:
                 admin_note += ("\n⚠️ <b>По исключению</b>: дату указали меньше чем за 30 дней до ДР — "
                                "обычно подарок в этом случае не даётся, ты разрешил вручную.")
         else:
-            text = "🎂 <b>С днём рождения!</b>\n\nОт всей нашей команды — счастья, здоровья и всего самого лучшего 🎉"
+            text = "🎂 <b>С днём рождения!</b>\n\nЖелаю счастья, здоровья и всего самого лучшего 🤖"
             admin_note = (f"🎂 Сегодня ДР у <b>{esc(user['username'])}</b> — подписка неактивна, "
                           f"поздравили без подарка.")
         try:
@@ -224,8 +350,8 @@ async def channel_autodelete_once(bot: Bot) -> None:
 
 async def background_loop(bot: Bot, interval: int = 600) -> None:
     while True:
-        for job in (check_once, autoclean_once, birthdays_once, bday_nag_once, channel_autodelete_once,
-                    jobs_watch_once):
+        for job in (check_once, admin_digest_once, autoclean_once, birthdays_once, bday_nag_once,
+                    channel_autodelete_once, jobs_watch_once):
             try:
                 await job(bot)
             except Exception:
