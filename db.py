@@ -94,6 +94,11 @@ class DB:
             if col not in pay_cols:
                 self.conn.execute(f"ALTER TABLE payments ADD COLUMN {col} {typ}")  # имена — константы
         self.conn.execute("CREATE INDEX IF NOT EXISTS payments_sbp_id ON payments(sbp_id)")
+        # входы/выходы в канале (только с момента включения; Telegram историю не отдаёт). Храним 180 дней.
+        self.conn.execute("""CREATE TABLE IF NOT EXISTS channel_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, chat_id INTEGER NOT NULL,
+            tg_id INTEGER NOT NULL, name TEXT, username TEXT, kind TEXT NOT NULL)""")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS channel_events_ts ON channel_events(ts)")
         self.conn.commit()
 
     # ---- заявки на доступ с выбранным именем и пригласившим ----
@@ -324,6 +329,15 @@ class DB:
         )
         self.conn.commit()
         return cur.lastrowid
+
+    def add_channel_event(self, chat_id: int, tg_id: int, name: str | None, username: str | None, kind: str) -> None:
+        self.conn.execute("INSERT INTO channel_events(ts, chat_id, tg_id, name, username, kind) VALUES(?,?,?,?,?,?)",
+                          (int(time.time()), chat_id, tg_id, name, username, kind))
+        self.conn.execute("DELETE FROM channel_events WHERE ts < ?", (int(time.time()) - 180 * 86400,))
+        self.conn.commit()
+
+    def channel_events_since(self, since_ts: int) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM channel_events WHERE ts >= ? ORDER BY ts", (since_ts,)).fetchall()
 
     def payment_by_sbp(self, sbp_id: str, exclude_pid: int) -> int | None:
         """Чек с той же операцией СБП (повтор оплаты даже в другом файле), кроме отклонённых."""

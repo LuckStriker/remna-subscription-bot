@@ -18,7 +18,8 @@ from keyboards import (AdminMenu, LinkCb, NodeCb, PayCb, ReqCb, SquadCb, UserCb,
                        back_to_admin, cancel_kb, kb, payment_kb, reject_kb, user_card_kb, user_menu,
                        REJECT_REASONS)
 from remnawave import RemnawaveError, human_bytes
-from promo import paid_promo_line, payment_details, reward_first_paid, reward_first_verified, reward_loyalty
+from promo import (paid_promo_line, payment_details, reward_big_payment, reward_first_paid, reward_first_verified,
+                   reward_loyalty)
 from tracking import clean_chat
 
 router = Router()
@@ -703,11 +704,14 @@ async def approve_payment(target: Message, bot: Bot, pid: int, days: int, admin_
         return
     paid_until = esc((updated.get('expireAt') or '')[:10])
     updated, loyal_user, loyal_admin = await reward_loyalty(user, updated, p["tg_id"], days, p["created_at"])
+    updated, big_user, big_admin = await reward_big_payment(updated, p["tg_id"], days)
     await target.answer(f"✅ Чек #{pid} принят: +{days} дн. для {esc(updated['username'])}, "
                         f"до {esc((updated.get('expireAt') or '')[:10])}."
-                        + (f"\n{loyal_admin}" if loyal_admin else ""))
+                        + (f"\n{loyal_admin}" if loyal_admin else "")
+                        + (f"\n{big_admin}" if big_admin else ""))
     await notify(bot, p["tg_id"], f"✅ <b>Оплата подтверждена!</b>\nПодписка продлена на {days} дн., "
                                   f"действует до {paid_until}."
+                                  + (f"\n\n{big_user}" if big_user else "")
                                   + (f"\n\n{loyal_user}" if loyal_user else "")
                                   + (f"\n\n{warn}" if warn else ""),
                  reply_markup=user_menu())

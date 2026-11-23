@@ -186,6 +186,26 @@ async def check_once(bot: Bot) -> None:
         await asyncio.sleep(0.05)  # бережём лимиты Telegram
 
 
+async def _channel_line(bot: Bot) -> str:
+    """«📣 Канал: 57 подписчиков, за сутки +2 / −1 (ушли: …)» — пусто, если за сутки никто не пришёл и не ушёл."""
+    events = db.channel_events_since(int(now_utc().timestamp()) - 86400)
+    if not events:
+        return ""
+    joins = [e for e in events if e["kind"] == "join"]
+    leaves = [e for e in events if e["kind"] == "leave"]
+    total = ""
+    chat = settings.group_chat_id or db.kv_get("group_chat_id")
+    if chat:
+        try:
+            total = f"{await bot.get_chat_member_count(int(chat))} подписчиков, "
+        except Exception:
+            pass
+    line = f"📣 Канал: {total}за сутки <b>+{len(joins)}</b> / <b>−{len(leaves)}</b>"
+    if leaves:
+        line += "\nУшли: " + ", ".join(esc(e["name"] or str(e["tg_id"])) for e in leaves[:10])
+    return line
+
+
 async def admin_digest_once(bot: Bot) -> None:
     """Раз в день утром — админу: кто заканчивается в ближайшие 3 дня и кто закончился за неделю и не продлил."""
     local = now_utc().astimezone(MSK)
@@ -204,9 +224,10 @@ async def admin_digest_once(bot: Bot) -> None:
             soon.append((hours, line))
         elif -168 <= hours <= 0:
             gone.append((hours, line))
-    if not soon and not gone:
+    chan = await _channel_line(bot)
+    if not soon and not gone and not chan:
         return
-    text = "☀️ <b>Сводка по подпискам</b>"
+    text = "☀️ <b>Сводка по подпискам</b>" + (f"\n\n{chan}" if chan else "")
     if soon:
         text += "\n\n⏳ Заканчиваются в ближайшие 3 дня:\n" + "\n".join(l for _, l in sorted(soon))
     if gone:

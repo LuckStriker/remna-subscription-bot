@@ -20,7 +20,7 @@ from the same chat.
 - Expiry reminders pinned at the top of the chat (configurable schedule, daytime only); after renewal the reminder turns into "✅ renewed"
 - Referral program: trial days for the invitee, bonus days for both after the first payment
 - Loyalty bonus for paying on time several months in a row (e.g. 3 months → +7 days, 6 → +14), streak shown in the profile
-- Bonus for the first payment made through the bot
+- Bonus for the first payment made through the bot; "first N who pay for a long period" promo (optional)
 - Birthday gift days, promo campaigns ("first N users"), price lock for early customers
 - Automatic chat cleanup
 
@@ -39,6 +39,8 @@ from the same chat.
 
 **For the group / channel**
 - Welcome message for newcomers (auto-deleted), quiet pinning, auto-deletion of service posts
+- Channel subscriber stats: joins/leaves are recorded, the admin is notified on every leave (client or not),
+  daily digest shows "+N / −M" and the subscriber count — the basis for keeping the channel clients-only
 
 ### Stack
 Python 3.12 · aiogram 3 · httpx · asyncssh · pypdf · SQLite · Remnawave API 3.x
@@ -80,7 +82,7 @@ Telegram-бот для небольшого сервиса подписок на
 - Напоминания об окончании подписки закрепляются вверху чата (по расписанию, только днём); после продления напоминание само становится «✅ продлено»
 - Реферальная программа: пробные дни приглашённому, бонус обоим после первой оплаты
 - Бонус за оплаты без перерыва (например, 3 месяца подряд → +7 дней, 6 → +14), серия видна в профиле
-- Бонус за первую оплату через бота
+- Бонус за первую оплату через бота; акция «первые N, оплатившие надолго» (по желанию)
 - Подарок на день рождения, акции «первые N», фиксация цены для ранних клиентов
 - Автоочистка переписки
 
@@ -100,6 +102,8 @@ Telegram-бот для небольшого сервиса подписок на
 
 **Для группы / канала**
 - Приветствие новичков (удаляется само), тихое закрепление, автоудаление служебных постов
+- Статистика подписчиков канала: входы и выходы записываются, админу приходит уведомление о каждой отписке
+  (клиент или нет), в утренней сводке — «+N / −M» и число подписчиков. Основа, чтобы канал был только для клиентов
 
 ### Технологии
 Python 3.12 · aiogram 3 · httpx · asyncssh · pypdf · SQLite · Remnawave API 3.x

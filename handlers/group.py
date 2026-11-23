@@ -5,7 +5,7 @@ import random
 import time
 
 from aiogram import Bot, F, Router
-from aiogram.filters import JOIN_TRANSITION, ChatMemberUpdatedFilter, Command
+from aiogram.filters import JOIN_TRANSITION, LEAVE_TRANSITION, ChatMemberUpdatedFilter, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, ChatMemberUpdated
@@ -13,7 +13,7 @@ from aiogram.types import InlineKeyboardButton as Btn
 from aiogram.types import Message
 
 from config import settings
-from core import api, db, esc, tg_of
+from core import api, db, esc, find_user, tg_of
 from keyboards import AdminMenu, AnnCb, back_to_admin, cancel_kb, kb
 from promo import promo_slots_left
 
@@ -53,6 +53,7 @@ async def _delete_later(bot: Bot, chat_id: int, message_id: int, minutes: int) -
 @router.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
 async def on_join(event: ChatMemberUpdated, bot: Bot):
     if event.chat.type == "channel":
+        _record_channel(event, "join")
         return  # в канале лично не поприветствовать — был бы пост для всех на каждого подписчика
     if settings.group_chat_id and event.chat.id != settings.group_chat_id:
         return
@@ -70,6 +71,41 @@ async def on_join(event: ChatMemberUpdated, bot: Bot):
         return log.warning("Не удалось поприветствовать %s: %s", member.id, e)
     if settings.welcome_delete_after > 0:
         asyncio.create_task(_delete_later(bot, event.chat.id, m.message_id, settings.welcome_delete_after))
+
+
+# ======================= подписчики канала =======================
+def _record_channel(event: ChatMemberUpdated, kind: str) -> None:
+    """Вход/выход в канале → база (для статистики). Только наш канал, без ботов."""
+    if settings.group_chat_id and event.chat.id != settings.group_chat_id:
+        return
+    u = event.new_chat_member.user
+    if u.is_bot:
+        return
+    db.add_channel_event(event.chat.id, u.id, u.full_name, u.username, kind)
+
+
+@router.chat_member(ChatMemberUpdatedFilter(LEAVE_TRANSITION), F.chat.type == "channel")
+async def on_channel_leave(event: ChatMemberUpdated, bot: Bot):
+    if settings.group_chat_id and event.chat.id != settings.group_chat_id:
+        return
+    u = event.new_chat_member.user
+    if u.is_bot:
+        return
+    _record_channel(event, "leave")
+    who = f"<b>{esc(u.full_name)}</b>" + (f" (@{esc(u.username)})" if u.username else "") + f" · <code>{u.id}</code>"
+    try:
+        acc = await find_user(u.id)
+    except Exception:
+        acc = None
+    if acc:
+        state = f"клиент: <b>{esc(acc['username'])}</b>, подписка до {esc((acc.get('expireAt') or '')[:10])}"
+    else:
+        state = "не клиент (или подписка не привязана к Telegram)"
+    for admin_id in settings.admin_ids:
+        try:
+            await bot.send_message(admin_id, f"👋 Отписался от канала: {who}\n{state}")
+        except Exception:
+            pass
 
 
 @router.message(Command("chatid"), F.chat.type.in_({"group", "supergroup"}),
@@ -184,7 +220,7 @@ async def bot_mentioned(msg: Message, bot: Bot) -> bool:
 def intro_text(admin_name: str, username: str = "") -> str:
     who = f'<a href="https://t.me/{username}">@{username}</a>' if username else f"<b>{esc(settings.bot_name)}</b>"
     return (
-        f"👋 Всем привет! Я — <b>{esc(settings.bot_name)}</b> ({who}), маленький помощник {esc(admin_name)}.\n\n"
+        f"🤖 Всем привет! Я — <b>{esc(settings.bot_name)}</b> ({who}), маленький помощник {esc(admin_name)}.\n\n"
         "Вот что я умею:\n"
         "📊 покажу, сколько осталось подписки, трафика и какие устройства подключены;\n"
         "🖼 выдам QR-код, чтобы подключиться за секунду;\n"
@@ -246,7 +282,7 @@ async def post_intro(bot: Bot, chat_id: int, boss: str, reply_to: int | None = N
     return m
 
 
-ADMIN_PINGS = ["На связи, админ! 🤖", "Тут я, тут 😏", "Слушаю и повинуюсь 🫡", "Бот на связи 👀"]
+ADMIN_PINGS = ["На связи, админ! 🤖", "Тут я, тут 😏", "Слушаю и повинуюсь, админ 🫡", "Бот на связи 👀"]
 
 
 @router.message(F.chat.type.in_({"group", "supergroup"}), from_group_admin, bot_mentioned)

@@ -190,6 +190,43 @@ def loyalty_hint(panel_id: int | None, expired: bool = False) -> str:
     return f"\n\n🔥 Оплатишь {when} — будет {n}-й месяц подряд, серия сохранится."
 
 
+_big_lock = asyncio.Lock()
+
+
+def big_promo_given() -> int:
+    return db.conn.execute("SELECT COUNT(*) FROM kv WHERE key LIKE 'big_promo:%' AND value<>''").fetchone()[0]
+
+
+async def reward_big_payment(updated: dict, tg_id: int, paid_days: int) -> tuple[dict, str, str]:
+    """Акция «первые N, оплатившие надолго»: чек от BIG_PROMO_MIN_DAYS дней → +BIG_PROMO_DAYS сверху.
+    Один раз на подписку (id в панели), админы не участвуют. Возвращает (подписка, строка клиенту, строка админу)."""
+    limit = settings.big_promo_limit
+    if limit <= 0 or settings.big_promo_days <= 0 or paid_days < settings.big_promo_min_days \
+            or tg_id in settings.admin_ids:
+        return updated, "", ""
+    async with _big_lock:
+        key = f"big_promo:{int(updated['id'])}"
+        if db.kv_get(key):
+            return updated, "", ""
+        place = big_promo_given() + 1
+        if place > limit:
+            return updated, "", ""
+        db.kv_set(key, str(tg_id))
+        try:
+            updated = await api.add_days(updated, settings.big_promo_days)
+        except RemnawaveError as e:
+            db.kv_set(key, "")
+            return updated, "", f"⚠️ Подарок «первые {limit}» (+{settings.big_promo_days} дн.) не начислен: {esc(e)}"
+    until = esc((updated.get("expireAt") or "")[:10])
+    admin = (f"🏆 Акция «первые {limit}, оплатившие надолго»: <b>{place}/{limit}</b> — "
+             f"+{settings.big_promo_days} дн. для <b>{esc(updated['username'])}</b>"
+             + ("\n🏁 Все места разобраны, акция завершена." if place >= limit else ""))
+    return (updated,
+            f"🏆 <b>Ты в числе первых {limit}, кто оплатил надолго!</b> Держи <b>+{settings.big_promo_days} дн.</b> "
+            f"в подарок — подписка действует до <b>{until}</b>.",
+            admin)
+
+
 _loyal_lock = asyncio.Lock()  # два чека одной подписки, одобренные одновременно, не дадут бонус дважды
 
 

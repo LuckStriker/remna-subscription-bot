@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.2.0 — 2026-11-23
+
+### English
+- **Channel subscriber stats.** Joins and leaves of the channel are recorded (kept 180 days). The admin gets a message
+  on every leave — whether the person is a client (account and expiry) or not. The morning digest shows the subscriber
+  count and "+N / −M" for the last day. Telegram does not give bots the subscriber list, so tracking starts from the update.
+- **"First N who pay for a long period" promo** (optional, BIG_PROMO_*, off by default): a receipt for
+  BIG_PROMO_MIN_DAYS+ days gives BIG_PROMO_DAYS on top of all other bonuses, once per subscription, race-safe.
+- Payment screen: pay on the expiry day; for advance payments add the caption "in advance" — shown to the admin.
+
+### Русский
+- **Статистика подписчиков канала.** Входы и выходы записываются (хранятся 180 дней). Админу приходит сообщение
+  о каждой отписке: клиент это (аккаунт и срок) или нет. В утренней сводке — число подписчиков и «+N / −M» за сутки.
+  Список подписчиков Telegram ботам не отдаёт, поэтому учёт идёт с момента обновления.
+- **Акция «первые N, оплатившие надолго»** (по желанию, BIG_PROMO_*, по умолчанию выключена): чек на
+  BIG_PROMO_MIN_DAYS+ дней даёт BIG_PROMO_DAYS сверху всех бонусов, один раз на подписку, без двойных начислений.
+- Экран оплаты: оплачивать в день окончания; при оплате заранее — подпись «наперёд», её видит админ.
 ## v1.1.0 — 2026-11-20
 
 ### English

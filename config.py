@@ -55,6 +55,9 @@ class Settings:
     paid_promo_days: int    # сколько дней дарить за первую оплату через бота (0 — бонус выключен)
     loyal_tiers: tuple      # бонус за оплаты подряд: ((месяцев, дней), ...), напр. 3:7,6:14; пусто — выключено
     loyal_grace_hours: int  # сколько часов после окончания чек ещё считается «вовремя»
+    big_promo_limit: int    # «первые N, оплатившие надолго» получают подарок (0 — акция выключена)
+    big_promo_min_days: int # от скольких дней в одобренном чеке (124 = от 4 месяцев)
+    big_promo_days: int     # сколько дней в подарок
     pay_bank: str           # реквизиты для оплаты (СБП)
     pay_phone: str
     pay_name: str
@@ -124,6 +127,9 @@ def load_settings() -> Settings:
         loyal_tiers=tuple(sorted((int(m), int(d)) for m, d in
                                  (x.split(":") for x in os.getenv("LOYAL_TIERS", "3:7,6:14").replace(" ", "").split(",") if x))),
         loyal_grace_hours=int(os.getenv("LOYAL_GRACE_HOURS", "72")),
+        big_promo_limit=int(os.getenv("BIG_PROMO_LIMIT", "0")),
+        big_promo_min_days=int(os.getenv("BIG_PROMO_MIN_DAYS", "124")),
+        big_promo_days=int(os.getenv("BIG_PROMO_DAYS", "31")),
         pay_bank=os.getenv("PAY_BANK", "").strip(),
         pay_phone=os.getenv("PAY_PHONE", "").strip(),
         pay_name=os.getenv("PAY_NAME", "").strip(),
