@@ -111,9 +111,12 @@ def cancel_kb() -> KB:
     return kb([Btn(text="✖️ Отмена", callback_data=AdminMenu(action="cancel").pack())])
 
 
-def payment_kb(pid: int) -> KB:
+def payment_kb(pid: int, amount: int | None = None, days: int | None = None) -> KB:
+    """amount/days — расчёт по сумме, которую бот прочитал из PDF: кнопка «✅ 350 ₽ → +36 дн.» сверху."""
     p = lambda t, act, d=0: Btn(text=t, callback_data=PayCb(action=act, pid=pid, days=d).pack())  # noqa: E731
+    top = [[p(f"✅ {amount} ₽ → +{days} дн.", "ok", days)]] if amount and days else []
     return kb(
+        *top,
         [p("✅ +31 дн.", "ok", 31), p("✅ +62 дн.", "ok", 62), p("✅ +93 дн.", "ok", 93)],
         [p("💰 По сумме из чека", "amount"), p("✍️ Своё кол-во дней", "custom")],
         [p("❌ Отклонить", "no")],

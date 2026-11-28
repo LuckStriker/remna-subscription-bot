@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.3.0 — 2026-11-28
+
+### English
+- **One-tap approval by receipt amount.** After the PDF auto-check the bot adds a button on top of the receipt card,
+  e.g. "✅ 350 ₽ → +36 days": days = amount × 31 ÷ the client's price. Not shown for underpayment or a duplicate
+  receipt — those stay manual (underpayment comes with a warning to the client).
+- **Access by invitation only.** A request without a valid referral link is declined by the bot itself with a polite
+  message ("ask a friend for an invite link"); the admin gets a silent note, no buttons. Requests via a referral link
+  work as before.
+- **Device limit from the panel.** `DEFAULT_DEVICES=0` no longer sets a per-user limit, so the panel's own rule
+  applies; the admin prompt says "0 — panel rule".
+
+### Русский
+- **Подтверждение по сумме чека в одно нажатие.** После автопроверки PDF бот добавляет сверху карточки чека кнопку,
+  например «✅ 350 ₽ → +36 дн.»: дни = сумма × 31 ÷ тариф клиента. При недоплате и повторном чеке кнопки нет,
+  решение руками (при недоплате клиенту уходит предупреждение).
+- **Доступ только по приглашению.** Заявку без действующей реферальной ссылки бот отклоняет сам вежливым
+  сообщением («попросите у друга ссылку-приглашение»), админу тихая заметка без кнопок. Заявки по ссылке как раньше.
+- **Лимит устройств из панели.** `DEFAULT_DEVICES=0` больше не задаёт лимит аккаунту, действует правило панели;
+  в подсказке админу «0 — по правилу панели».
+
 ## v1.2.0 — 2026-11-23
 
 ### English

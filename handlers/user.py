@@ -454,6 +454,7 @@ async def _auto_check(bot: Bot, pid: int, tg_id: int, doc, admin_msgs: list) -> 
     """Помощник проверки: читает дату/сумму/получателя из PDF и отвечает админу под чеком. Клиент этого не видит.
     Любая ошибка здесь не мешает чеку — админ просто проверит вручную."""
     report = None
+    amount = days = None
     try:
         buf = io.BytesIO()
         await bot.download(doc, destination=buf)
@@ -463,7 +464,13 @@ async def _auto_check(bot: Bot, pid: int, tg_id: int, doc, admin_msgs: list) -> 
         if parsed and parsed.get("sbp_id"):
             dup_pid = db.payment_by_sbp(parsed["sbp_id"], pid)
             db.set_payment_check(pid, parsed["sbp_id"], parsed.get("op_ts"))
-        report = receipts.assess(parsed, price_for(tg_id), time.time(), dup_pid)
+        tariff = price_for(tg_id)
+        report = receipts.assess(parsed, tariff, time.time(), dup_pid)
+        # Готовый расчёт по сумме из PDF: дни = сумма × 31 ÷ тариф клиента (как кнопка «По сумме из чека»).
+        # Недоплату и повторный чек не подсказываем: там решение руками (недоплата — с предупреждением клиенту).
+        a = (parsed or {}).get("amount")
+        if a and a >= tariff and not dup_pid:
+            amount, days = int(a), int(a) * 31 // tariff
     except Exception as e:
         log.warning("Автопроверка чека #%s не удалась: %s", pid, e)
         report = "🤖 <b>Проверка чека:</b> не получилось — проверь вручную."
@@ -472,6 +479,11 @@ async def _auto_check(bot: Bot, pid: int, tg_id: int, doc, admin_msgs: list) -> 
             await bot.send_message(m.chat.id, report, reply_to_message_id=m.message_id)
         except Exception as e:
             log.warning("Не удалось отправить отчёт проверки чека #%s: %s", pid, e)
+        if amount and days:
+            try:
+                await m.edit_reply_markup(reply_markup=payment_kb(pid, amount, days))
+            except Exception as e:
+                log.warning("Не удалось добавить кнопку расчёта к чеку #%s: %s", pid, e)
 
 
 @router.message(PayStates.waiting_receipt)
@@ -517,6 +529,32 @@ class AccessStates(StatesGroup):
     name = State()
 
 
+INVITE_ONLY = ("Привет! Я подключаю только по приглашению, это маленький сервис для своих. "
+               "Если среди знакомых есть кто-то, кто уже пользуется, попросите у него ссылку-приглашение из бота. "
+               "По ней я вас подключу, и ещё будет бонус обоим 🤝")
+_invite_noted: dict[int, float] = {}  # не дёргать админа повторно от одного и того же человека
+
+
+async def _valid_referrer(tg_id: int) -> dict | None:
+    """Пригласивший из реферальной ссылки (kv ref:<tg>), если он действующий клиент."""
+    raw = db.kv_get(f"ref:{tg_id}")
+    return await find_user(int(raw)) if raw and raw.isdigit() else None
+
+
+async def _note_invite_only(bot: Bot, u) -> None:
+    """Тихая заметка админу: кто постучался без приглашения. Без кнопок и без звука."""
+    if time.time() - _invite_noted.get(u.id, 0) < 86400:
+        return
+    _invite_noted[u.id] = time.time()
+    text = (f"🔒 Без приглашения, отказал автоматически: {esc(u.full_name)} "
+            f"(@{esc(u.username or 'нет')}, <code>{u.id}</code>)")
+    for admin_id in settings.admin_ids:
+        try:
+            await bot.send_message(admin_id, text, disable_notification=True)
+        except Exception as e:
+            log.warning("Не удалось отправить заметку админу %s: %s", admin_id, e)
+
+
 @router.callback_query(UserMenu.filter(F.action == "request"))
 async def cb_request(cb: CallbackQuery, state: FSMContext):
     if await find_user(cb.from_user.id):
@@ -525,6 +563,9 @@ async def cb_request(cb: CallbackQuery, state: FSMContext):
     if not db.can_request_access(cb.from_user.id):
         return await cb.answer("Заявка уже отправлена, ожидайте ответа", show_alert=True)
     await cb.answer()
+    if not await _valid_referrer(cb.from_user.id):  # доступ только по приглашению: чужих бот отсекает сам
+        await cb.message.answer(INVITE_ONLY, reply_markup=back_to_user_menu())
+        return await _note_invite_only(cb.bot, cb.from_user)
     await state.set_state(AccessStates.name)
     await cb.message.answer(
         "✍️ <b>Придумай себе имя</b> — так тебя будет видно в приложении и в панели.\n\n"
@@ -549,8 +590,9 @@ async def on_name(msg: Message, state: FSMContext, bot: Bot):
     ref_raw = db.kv_get(f"ref:{msg.from_user.id}")
     ref_id = int(ref_raw) if ref_raw else None
     ref_user = await find_user(ref_id) if ref_id else None
-    if not ref_user:
-        ref_id = None
+    if not ref_user:  # мог начать заявку до включения правила или пригласивший пропал из панели
+        await msg.answer(INVITE_ONLY, reply_markup=back_to_user_menu())
+        return await _note_invite_only(bot, msg.from_user)
     db.save_request(msg.from_user.id, msg.from_user.full_name, name, ref_id)
 
     text = (f"🔔 <b>Заявка на доступ</b>\n"

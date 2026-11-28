@@ -201,7 +201,7 @@ async def create_days(msg: Message, state: FSMContext):
 async def _set_traffic(target: Message, state: FSMContext, gb: int):
     await state.update_data(traffic=gb)
     await state.set_state(CreateUser.devices)
-    await target.answer(f"Лимит устройств (0 — без лимита, по умолчанию {settings.default_devices}):",
+    await target.answer(f"Лимит устройств (0 — по правилу панели, по умолчанию {settings.default_devices}):",
                         reply_markup=kb([Btn(text=str(d or '∞'), callback_data=f"cv:{d}") for d in (0, 1, 2, 3, 5)],
                                         [Btn(text="✖️ Отмена", callback_data=AdminMenu(action="cancel").pack())]))
 
